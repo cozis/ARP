@@ -316,6 +316,31 @@ void printARPIPToMACPacket(ARPHeader_IPv4_MAC *packet)
            ntohs(packet->base.operation) == ARPOP_REQUEST ? "REQUEST" : "REPLY");
 }
 
+void buildARPResponseInPlace(Snack *snack, ARPHeader_IPv4_MAC *packet)
+{
+    packet->targetIP  = packet->senderIP;
+    packet->targetMAC = packet->senderMAC;
+    packet->senderIP  = snack->IP;
+    packet->senderMAC = snack->MAC;
+    packet->base.operation = htons(ARPOP_REPLY);
+    packet->base.base.dst = packet->base.base.src;
+    packet->base.base.src = snack->MAC;
+}
+
+bool sendUsingDevice(MACAddress MAC, int deviceIndex, 
+                     int fd, const void *data, size_t size)
+{
+    struct sockaddr_ll deviceAddress;
+    deviceAddress.sll_ifindex = deviceIndex;
+    deviceAddress.sll_halen = 6; // Ethernet address length, which is 6.
+    memcpy(deviceAddress.sll_addr, &MAC, 6);
+
+    ssize_t result = sendto(fd, data, size, 0, 
+                            (struct sockaddr*) &deviceAddress, 
+                            sizeof(deviceAddress));
+    return result >= 0;
+}
+
 static void handleARPPacket(Snack *snack, ARPTranslationTable *table, 
                             EthernetHeader *frame, size_t frameSize)
 {
@@ -328,7 +353,7 @@ static void handleARPPacket(Snack *snack, ARPTranslationTable *table,
         return;
 
     ARPHeader_IPv4_MAC *packet = (ARPHeader_IPv4_MAC*) frame;
-    printARPIPToMACPacket(packet);
+    //printARPIPToMACPacket(packet);
 
     bool updated = ARPTranslationTable_updateIP(table, packet->senderMAC, packet->senderIP);
 
@@ -339,25 +364,10 @@ static void handleARPPacket(Snack *snack, ARPTranslationTable *table,
                 fprintf(stderr, "WARNING :: Couldn't update translation table\n");
         
         if (packet->base.operation == htons(ARPOP_REQUEST)) {
-            packet->targetIP  = packet->senderIP;
-            packet->targetMAC = packet->senderMAC;
-            packet->senderIP  = snack->IP;
-            packet->senderMAC = snack->MAC;
-            packet->base.operation = htons(ARPOP_REPLY);
-            packet->base.base.dst = packet->base.base.src;
-            packet->base.base.src = snack->MAC;
-
-            printf("(reply) ");
-            printARPIPToMACPacket(packet);
-            struct sockaddr_ll deviceAddress;
-            deviceAddress.sll_ifindex = snack->deviceIndex;
-            deviceAddress.sll_halen = 6; // Ethernet address length, which is 6.
-            memcpy(deviceAddress.sll_addr, &snack->MAC, 6);
-            ssize_t result = sendto(snack->socketDescriptor, frame, 
-                                    sizeof(ARPHeader_IPv4_MAC), 0, 
-                                    (struct sockaddr*) &deviceAddress, 
-                                    sizeof(deviceAddress));
-            if (result < 0)
+            buildARPResponseInPlace(snack, packet);
+            if (!sendUsingDevice(snack->MAC, snack->deviceIndex, 
+                                 snack->socketDescriptor, frame, 
+                                 frameSize))
                 reportError("Failed to send ARP reply (%s)\n", strerror(errno));
         }
     }
