@@ -1,3 +1,3 @@
 
 all:
-	gcc main.c -o main -Wall -Wextra
+	gcc main.c utils.c -o main -Wall -Wextra

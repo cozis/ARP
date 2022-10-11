@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
@@ -15,10 +14,10 @@
 #include <linux/if.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
+#include "types.h"
+#include "utils.h"
 
 // Can the raw socket receive partial ethernet frames?
-
-#define PACKED __attribute__((packed))
 
 //  +---------------+ 0
 //  | dst MAC addr  |
@@ -34,13 +33,69 @@
 //  | CRC checksum  |
 //  +---------------+
 
-// proto=800, 86DD, 806
+typedef struct {
+    IPAddress IPWithUnknownMAC;
+    void *userp;
+    void (*callback)(void *userp, MACAddress MAC);
+} PendingIPPacket;
 
-typedef struct { uint8_t bytes[6]; } MACAddress;
-typedef uint32_t IPAddress;
+typedef struct {
+    PendingIPPacket *packets;
+    size_t size, used;
+} PendingIPPacketList;
 
-_Static_assert(sizeof(IPAddress) == 4,  "??? :)");
-_Static_assert(sizeof(MACAddress) == 6, "Struct was packed in an unexpected way");
+void PendingIPPacketList_init(PendingIPPacketList *packetList)
+{
+    packetList->packets = NULL;
+    packetList->size = 0;
+    packetList->used = 0;
+}
+
+void PendingIPPacketList_free(PendingIPPacketList *packetList)
+{
+    free(packetList->packets);
+}
+
+bool PendingIPPacketList_append(PendingIPPacketList *packetList, IPAddress IP, 
+                                void *userp, void (*callback)(void *userp, MACAddress MAC))
+{
+    if (packetList->packets == NULL || packetList->size == packetList->used) {
+
+        size_t newSize;
+        if (packetList->packets == NULL)
+            newSize = 8;
+        else
+            newSize = 2 * packetList->size;
+
+        assert(newSize > 0);
+
+        void *temp = realloc(packetList->packets, newSize * sizeof(PendingIPPacket));
+        if (temp == NULL)
+            return false;
+
+        packetList->packets = temp;
+        packetList->size = newSize;
+    }
+
+    size_t k = packetList->used++;
+    packetList->packets[k].IPWithUnknownMAC = IP;
+    packetList->packets[k].callback = callback;
+    packetList->packets[k].userp = userp;
+    return true;
+}
+
+void PendingIPPacketList_resolve(PendingIPPacketList *packetList, MACAddress MAC, IPAddress IP)
+{
+    size_t resolved = 0;
+    for (size_t i = 0; i < packetList->used; ++i)
+        if (packetList->packets[i].IPWithUnknownMAC == IP) {
+            packetList->packets[i].callback(packetList->packets[i].userp, MAC);
+            resolved++;
+        } else
+            packetList->packets[i - resolved] = packetList->packets[i];
+    packetList->used -= resolved;
+    // TODO: Downsize the array?
+}
 
 typedef struct {
     MACAddress dst;
@@ -76,20 +131,24 @@ typedef struct {
     IPAddress  targetIP;
 } PACKED ARPHeader_IPv4_MAC;
 
-static void reportError_(const char *file, size_t line, const char *format, ...)
-{
-    fprintf(stderr, "ERROR :: ");
+typedef struct {
+    EthernetHeader base;
+    uint8_t version: 4;
+    uint8_t IHL: 4;
+    uint8_t typeOfService: 6;
+    uint8_t ECN: 2;
+    uint16_t totalLength;
+    uint16_t identifier;
+    uint8_t flags: 3;
+    uint16_t fragOffset: 13;
+    uint8_t timeToLive;
+    uint8_t protocol;
+    uint16_t checksum;
+    IPAddress srcIP;
+    IPAddress dstIP;
+    /* .. options .. */
+} PACKED IPHeader;
 
-    va_list args;
-    va_start(args, format);
-    vfprintf(stderr, format, args);
-    va_end(args);
-
-    fprintf(stderr, "(Error reported at %s:%ld)\n", file, line);
-}
-
-#define reportError(format, ...) \
-    reportError_(__FILE__, __LINE__, format, ##__VA_ARGS__)
 
 typedef struct {
     MACAddress *MACs;
@@ -182,14 +241,6 @@ static bool isARPIPv4OverEthernet(ARPHeader *packet)
     if (packet->protocolAddressSize != sizeof(IPAddress))
         return false;
     return true;
-}
-
-static bool sniffin = true;
-
-static void sigFunc(int signo)
-{
-    if (signo == SIGINT)
-        sniffin = false;
 }
 
 static const char *getProtoName(uint16_t protoID)
@@ -341,8 +392,9 @@ bool sendUsingDevice(MACAddress MAC, int deviceIndex,
     return result >= 0;
 }
 
-static void handleARPPacket(Snack *snack, ARPTranslationTable *table, 
-                            EthernetHeader *frame, size_t frameSize)
+static void handleARPPacket(Snack *snack, ARPTranslationTable *table,
+                            PendingIPPacketList *pending, EthernetHeader *frame, 
+                            size_t frameSize)
 {
     assert(frame != NULL && ntohs(frame->proto) == ET_ARP);
 
@@ -358,19 +410,52 @@ static void handleARPPacket(Snack *snack, ARPTranslationTable *table,
     bool updated = ARPTranslationTable_updateIP(table, packet->senderMAC, packet->senderIP);
 
     if (packet->targetIP == snack->IP) {
-        
-        if (!updated)
+    
+        bool inserted = false;        
+        if (!updated) {
             if (!ARPTranslationTable_insert(table, packet->senderMAC, packet->senderIP))
                 fprintf(stderr, "WARNING :: Couldn't update translation table\n");
+            else
+                inserted = true;
+        }
         
         if (packet->base.operation == htons(ARPOP_REQUEST)) {
             buildARPResponseInPlace(snack, packet);
             if (!sendUsingDevice(snack->MAC, snack->deviceIndex, 
-                                 snack->socketDescriptor, frame, 
-                                 frameSize))
+                                 snack->socketDescriptor, frame, frameSize))
                 reportError("Failed to send ARP reply (%s)\n", strerror(errno));
         }
+
+        if (inserted)
+            PendingIPPacketList_resolve(pending, packet->senderMAC, packet->senderIP);
     }
+}
+
+static void handleIPv4Packet(Snack *snack, ARPTranslationTable *table,
+                             PendingIPPacketList *pending, EthernetHeader *frame, 
+                             size_t frameSize)
+{
+    assert(frame != NULL && frame->proto == htons(ET_IPv4));
+
+    if (frameSize < sizeof(IPHeader))
+        return;
+
+    IPHeader *packet = (IPHeader*) frame;
+
+    /*
+    if (snack->IP == packet->dstIP) {
+        // f-for m-m-me?? uwu >w<
+        ARPTranslationTable_getMACByIP();
+    }
+    */
+    fprintf(stderr, "IP packet size: %d\n", packet->totalLength);
+}
+
+static bool sniffin = true;
+static void sigFunc(int signo)
+{
+    if (signo == SIGINT)
+        sniffin = false;
 }
 
 int main(void)
@@ -392,6 +477,9 @@ int main(void)
 
     ARPTranslationTable table;
     memset(&table, 0, sizeof(ARPTranslationTable));
+
+    PendingIPPacketList pending;
+    PendingIPPacketList_init(&pending);
 
     while (sniffin) {
 
@@ -418,8 +506,8 @@ int main(void)
             EthernetHeader *header = (EthernetHeader*) buffer;
             printFrameHeader(header, stdout);
             switch (ntohs(header->proto)) {
-                case ET_ARP: handleARPPacket(&snack, &table, header, len); break;
-                case ET_IPv4:break;
+                case ET_ARP:  handleARPPacket(&snack, &table, &pending, header, len); break;
+                case ET_IPv4: handleIPv4Packet(&snack, &table, &pending, header, len); break;
                 case ET_IPv6:break;
             }
         }
@@ -427,5 +515,6 @@ int main(void)
 
     free(buffer);
     Snack_free(&snack);
+    PendingIPPacketList_free(&pending);
     return 0;
 }
